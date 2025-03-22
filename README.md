@@ -12,3 +12,9 @@ diff regression on datasets display the highest accuracy and least error output 
 row and col-3,4,5,6
 ml - 7
 graph - 1,2
+
+
+Soumashree-
+issues-
+1. run prediction not working after outlier detection applied
+2. student dataset(student-mat,student-por)
