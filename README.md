@@ -16,5 +16,5 @@ graph - 1,2
 
 Soumashree-
 issues-
-1. run prediction not working after outlier detection applied
+1. run prediction gives correct answer or not?
 2. student dataset(student-mat,student-por)
