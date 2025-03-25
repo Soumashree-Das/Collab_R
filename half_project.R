@@ -76,6 +76,7 @@ server <- function(input, output, session) {
     }
   })
   
+  #code for histogram 
   output$histogram <- renderPlot({
     req(data())
     num_cols <- names(Filter(is.numeric, data()))
