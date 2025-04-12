@@ -13,16 +13,30 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       fileInput("file", "Upload CSV File", accept = ".csv"),
-      uiOutput("drop_columns_ui"),  # UI for selecting columns to drop
-      uiOutput("drop_rows_ui"),     # UI for selecting rows to drop
-      checkboxInput("auto_clean", "Automatic Cleaning", FALSE),  # Checkbox for automatic cleaning
+      
+      # New approach for column dropping
+      tags$hr(),
+      tags$h4("Column Management"),
+      uiOutput("column_selector_ui"),
+      actionButton("drop_selected_columns", "Drop Selected Columns", class = "btn-warning"),
+      verbatimTextOutput("drop_columns_message"),
+      tags$hr(),
+      
+      # Row dropping
+      uiOutput("drop_rows_ui"),
+      
+      # Auto-cleaning option
+      checkboxInput("auto_clean", "Automatic Cleaning", FALSE),
       
       # Prediction inputs
+      tags$h4("Prediction"),
       uiOutput("prediction_target_ui"),
       uiOutput("predictor_inputs_ui"),
       actionButton("run_prediction", "Run Prediction"),
       
       # Heatmap and outlier controls
+      tags$hr(),
+      tags$h4("Analysis Options"),
       uiOutput("heatmap_columns_ui"),
       actionButton("remove_outliers", "Remove Outliers", class = "btn-danger")
     ),
@@ -49,22 +63,27 @@ ui <- fluidPage(
         tabPanel("Data Visualization",
                  selectInput("plot_type", "Select Plot Type",
                              choices = c("Pair Plot", "Scatter Plot", "Box Plot", 
-                                         "Line Plot", "Residual Plot", "Q-Q Plot"),
+                                         "Line Plot", "Residual Plot", "Q-Q Plot", "Histogram"),
                              selected = "Pair Plot"),
                  uiOutput("plot_specific_ui"),
                  plotOutput("data_viz_plot", height = "600px", width = "600px")
         ),
         tabPanel("Heatmap", 
                  plotOutput("heatmap", height = "600px", width = "600px")),
-        tabPanel("Prediction Results", verbatimTextOutput("prediction_results"))
+        tabPanel("Prediction Results", 
+                 verbatimTextOutput("prediction_results"),
+                 verbatimTextOutput("model_summary"))
       )
     )
   )
 )
 
 server <- function(input, output, session) {
+  # Initialize reactive values
   original_data <- reactiveVal(NULL)
   cleaned_data <- reactiveVal(NULL)
+  current_model <- reactiveVal(NULL)
+  drop_message <- reactiveVal("")
   
   # Load data when file is uploaded
   observeEvent(input$file, {
@@ -72,50 +91,98 @@ server <- function(input, output, session) {
     df <- read.csv(input$file$datapath, na.strings = c("", "NA", "?")) # Treat "?" as NA
     original_data(df)
     cleaned_data(df)
+    drop_message("") # Reset drop message
   })
   
-  # UI for selecting columns to drop
-  output$drop_columns_ui <- renderUI({
+  # Column selector UI - this is the new approach
+  output$column_selector_ui <- renderUI({
     req(cleaned_data())
-    selectInput("drop_columns", "Select Columns to Drop", choices = names(cleaned_data()), multiple = TRUE)
+    selectInput("columns_to_drop", "Select Columns to Drop", 
+                choices = names(cleaned_data()), 
+                multiple = TRUE,
+                selected = NULL)
   })
   
-  # UI for selecting rows to drop
+  # Row dropping UI
   output$drop_rows_ui <- renderUI({
     req(cleaned_data())
-    textInput("drop_rows", "Drop Rows (Enter Row Indices, comma-separated)", value = "")
+    tagList(
+      textInput("drop_rows", "Drop Rows (Enter Row Indices, comma-separated)", value = ""),
+      actionButton("drop_selected_rows", "Drop Selected Rows", class = "btn-warning")
+    )
   })
   
-  # Reactive expression for data cleaning
-  observe({
-    req(original_data())
-    df <- original_data()
+  # Action to drop columns when button is clicked
+  observeEvent(input$drop_selected_columns, {
+    req(cleaned_data(), input$columns_to_drop)
     
-    # Drop selected columns
-    if (!is.null(input$drop_columns)) {
-      df <- df %>% select(-all_of(input$drop_columns))
+    df <- cleaned_data()
+    columns_to_drop <- input$columns_to_drop
+    
+    if(length(columns_to_drop) > 0) {
+      # Make sure selected columns exist in the dataset
+      valid_columns <- intersect(columns_to_drop, names(df))
+      
+      if(length(valid_columns) > 0) {
+        # Drop the columns
+        df <- df %>% select(-all_of(valid_columns))
+        cleaned_data(df)
+        drop_message(paste("Successfully dropped columns:", paste(valid_columns, collapse=", ")))
+      } else {
+        drop_message("No valid columns selected for dropping.")
+      }
+    } else {
+      drop_message("No columns selected for dropping.")
     }
+  })
+  
+  # Action to drop rows when button is clicked
+  observeEvent(input$drop_selected_rows, {
+    req(cleaned_data(), input$drop_rows)
     
-    # Drop selected rows
-    if (!is.null(input$drop_rows) && input$drop_rows != "") {
-      row_indices <- as.numeric(unlist(strsplit(input$drop_rows, ",")))  # Convert input to numeric vector
-      row_indices <- na.omit(row_indices)  # Remove invalid values
+    df <- cleaned_data()
+    
+    if(input$drop_rows != "") {
+      row_indices <- as.numeric(unlist(strsplit(input$drop_rows, ",")))
+      row_indices <- na.omit(row_indices)
+      
       if(length(row_indices) > 0) {
-        df <- df[-row_indices, , drop = FALSE]  # Drop rows safely
+        # Filter out indices that are out of bounds
+        valid_indices <- row_indices[row_indices > 0 & row_indices <= nrow(df)]
+        
+        if(length(valid_indices) > 0) {
+          df <- df[-valid_indices, , drop = FALSE]
+          cleaned_data(df)
+          drop_message(paste("Successfully dropped", length(valid_indices), "rows."))
+        } else {
+          drop_message("No valid row indices provided.")
+        }
+      } else {
+        drop_message("No row indices provided.")
       }
     }
-    
-    # Automatic cleaning
-    if (input$auto_clean) {
+  })
+  
+  # Display drop message
+  output$drop_columns_message <- renderText({
+    drop_message()
+  })
+  
+  # Auto clean functionality
+  observeEvent(input$auto_clean, {
+    req(cleaned_data())
+    if(input$auto_clean) {
+      df <- cleaned_data()
+      
       # 1️⃣ Remove columns with more than 50% missing values
-      missing_threshold <- 0.5  # User can modify this threshold
+      missing_threshold <- 0.5
       drop_missing <- names(df)[colMeans(is.na(df)) > missing_threshold]
       if(length(drop_missing) > 0) {
         df <- df %>% select(-all_of(drop_missing))
       }
       
       # 2️⃣ Remove near-zero variance columns
-      if (ncol(df) > 1) {  # Ensure at least 1 column remains
+      if (ncol(df) > 1) {
         nzv <- nearZeroVar(df, saveMetrics = TRUE)
         drop_nzv <- rownames(nzv[nzv$nzv, ])
         if(length(drop_nzv) > 0) {
@@ -132,9 +199,10 @@ server <- function(input, output, session) {
           df <- df %>% select(-all_of(high_corr))
         }
       }
+      
+      cleaned_data(df)
+      drop_message("Auto-cleaning applied successfully.")
     }
-    
-    cleaned_data(df)
   })
   
   # Dataset stats
@@ -150,18 +218,29 @@ server <- function(input, output, session) {
   
   output$row_count_after <- renderPrint({
     req(cleaned_data())
-    paste("Rows after cleanup:", nrow(cleaned_data()))
+    paste("Current number of rows:", nrow(cleaned_data()))
   })
   
   output$col_count_after <- renderPrint({
     req(cleaned_data())
-    paste("Columns after cleanup:", ncol(cleaned_data()))
+    paste("Current number of columns:", ncol(cleaned_data()))
   })
   
   # Data preview and summary
-  output$data_preview <- renderDataTable({ cleaned_data() })
-  output$data_summary <- renderPrint({ summary(cleaned_data()) })
-  output$column_names <- renderPrint({ colnames(cleaned_data()) })
+  output$data_preview <- renderDataTable({ 
+    req(cleaned_data())
+    cleaned_data() 
+  })
+  
+  output$data_summary <- renderPrint({ 
+    req(cleaned_data())
+    summary(cleaned_data()) 
+  })
+  
+  output$column_names <- renderPrint({ 
+    req(cleaned_data())
+    colnames(cleaned_data()) 
+  })
   
   output$numeric_columns <- renderPrint({
     req(cleaned_data())
@@ -254,6 +333,7 @@ server <- function(input, output, session) {
                                new_data[[col]] <= (Q3 + 1.5 * IQR) | is.na(new_data[[col]]), ]
       }
       cleaned_data(new_data)
+      drop_message(paste("Removed outliers from", length(num_cols), "numeric columns."))
       removeModal()
     }
   })
@@ -338,6 +418,11 @@ server <- function(input, output, session) {
         selectInput("line_x", "Select X Variable (Ordered)", choices = names(df)),
         selectInput("line_y", "Select Y Variable (Numeric)", choices = num_cols)
       )
+    } else if (input$plot_type == "Histogram") {
+      tagList(
+        selectInput("hist_var", "Select Variable for Histogram", choices = num_cols),
+        sliderInput("bins", "Number of Bins:", min = 5, max = 50, value = 15)
+      )
     } else if (input$plot_type %in% c("Residual Plot", "Q-Q Plot")) {
       tagList(
         selectInput("target_variable_viz", "Select Target Variable for Model", choices = num_cols)
@@ -390,6 +475,13 @@ server <- function(input, output, session) {
         labs(title = paste("Line Plot of", input$line_y, "over", input$line_x),
              x = input$line_x, y = input$line_y) +
         theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      
+    } else if (input$plot_type == "Histogram") {
+      req(input$hist_var)
+      ggplot(df, aes_string(x = input$hist_var)) +
+        geom_histogram(bins = input$bins, fill = "blue", alpha = 0.5) +
+        labs(title = paste("Histogram of", input$hist_var),
+             x = input$hist_var, y = "Frequency")
       
     } else if (input$plot_type %in% c("Residual Plot", "Q-Q Plot")) {
       req(input$target_variable_viz)
@@ -459,6 +551,10 @@ server <- function(input, output, session) {
       output$prediction_results <- renderPrint({
         "Error: Target variable must be numeric for linear regression."
       })
+      output$model_summary <- renderPrint({
+        NULL
+      })
+      current_model(NULL)
       return()
     }
     
@@ -477,9 +573,11 @@ server <- function(input, output, session) {
     
     output$prediction_results <- renderPrint({
       if (nrow(model_df) < 2) {
+        current_model(NULL)
         "Error: At least 2 rows are required for prediction modeling."
       } else if (nrow(model_df) <= length(predictors) + 1) {
         mean_value <- mean(model_df[[target]], na.rm = TRUE)
+        current_model(NULL)
         paste("Dataset too small for regression. Using mean prediction.\n",
               "Predicted", target, ":", mean_value)
       } else {
@@ -493,6 +591,8 @@ server <- function(input, output, session) {
           cat("Model training error:", e$message, "\n")
           return(NULL)
         })
+        
+        current_model(model)
         
         if (is.null(model)) {
           "Error: Failed to train the model. Check data consistency or predictors."
@@ -529,6 +629,15 @@ server <- function(input, output, session) {
             paste("Predicted", target, ":", round(prediction, 4))
           }
         }
+      }
+    })
+    
+    # Display model summary if available
+    output$model_summary <- renderPrint({
+      model <- current_model()
+      if (!is.null(model)) {
+        cat("Model Summary:\n")
+        summary(model$finalModel)
       }
     })
   })
