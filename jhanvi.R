@@ -7,6 +7,11 @@ library(corrplot)
 library(shinyWidgets)
 library(caret)
 library(tidyr)
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(gbm)
+library(earth) # For MARS models
 
 ui <- fluidPage(
   titlePanel("Collaborative Data Analysis & Prediction Workspace"),
@@ -14,7 +19,7 @@ ui <- fluidPage(
     sidebarPanel(
       fileInput("file", "Upload CSV File", accept = ".csv"),
       
-      # New approach for column dropping
+      # Column Management
       tags$hr(),
       tags$h4("Column Management"),
       uiOutput("column_selector_ui"),
@@ -31,8 +36,24 @@ ui <- fluidPage(
       # Prediction inputs
       tags$h4("Prediction"),
       uiOutput("prediction_target_ui"),
+      
+      # Model selection - NEW
+      uiOutput("model_selection_ui"),
+      
+      # Cross-validation options - NEW
+      selectInput("cv_method", "Cross-Validation Method:",
+                  choices = c("None" = "none", 
+                              "K-Fold" = "cv", 
+                              "Repeated K-Fold" = "repeatedcv"),
+                  selected = "cv"),
+      numericInput("cv_k", "Number of Folds (K):", 5, min = 2, max = 20),
+      conditionalPanel(
+        condition = "input.cv_method == 'repeatedcv'",
+        numericInput("cv_repeats", "Number of Repeats:", 3, min = 1, max = 10)
+      ),
+      
       uiOutput("predictor_inputs_ui"),
-      actionButton("run_prediction", "Run Prediction"),
+      actionButton("run_prediction", "Run Prediction", class = "btn-primary"),
       
       # Heatmap and outlier controls
       tags$hr(),
@@ -70,9 +91,16 @@ ui <- fluidPage(
         ),
         tabPanel("Heatmap", 
                  plotOutput("heatmap", height = "600px", width = "600px")),
+        
+        # New tab for model comparison
+        tabPanel("Model Comparison", 
+                 verbatimTextOutput("model_comparison_results"),
+                 plotOutput("model_comparison_plot", height = "400px", width = "600px")),
+        
         tabPanel("Prediction Results", 
                  verbatimTextOutput("prediction_results"),
-                 verbatimTextOutput("model_summary"))
+                 verbatimTextOutput("model_summary"),
+                 plotOutput("variable_importance_plot", height = "400px", width = "600px"))
       )
     )
   )
@@ -83,6 +111,8 @@ server <- function(input, output, session) {
   original_data <- reactiveVal(NULL)
   cleaned_data <- reactiveVal(NULL)
   current_model <- reactiveVal(NULL)
+  all_models <- reactiveVal(list()) # Store all trained models
+  best_model <- reactiveVal(NULL) # Store the best model
   drop_message <- reactiveVal("")
   
   # Load data when file is uploaded
@@ -94,7 +124,7 @@ server <- function(input, output, session) {
     drop_message("") # Reset drop message
   })
   
-  # Column selector UI - this is the new approach
+  # Column selector UI
   output$column_selector_ui <- renderUI({
     req(cleaned_data())
     selectInput("columns_to_drop", "Select Columns to Drop", 
@@ -110,6 +140,22 @@ server <- function(input, output, session) {
       textInput("drop_rows", "Drop Rows (Enter Row Indices, comma-separated)", value = ""),
       actionButton("drop_selected_rows", "Drop Selected Rows", class = "btn-warning")
     )
+  })
+  
+  # Model selection UI - NEW
+  output$model_selection_ui <- renderUI({
+    checkboxGroupInput("selected_models", "Select Regression Models:",
+                       choices = c(
+                         "Linear Regression" = "lm",
+                         "Ridge Regression" = "glmnet",
+                         "Lasso Regression" = "lasso",
+                         "Random Forest" = "rf",
+                         "Gradient Boosting" = "gbm",
+                         "XGBoost" = "xgbTree",
+                         "Support Vector Regression" = "svmRadial",
+                         "MARS" = "earth"
+                       ),
+                       selected = c("lm", "rf", "xgbTree"))
   })
   
   # Action to drop columns when button is clicked
@@ -376,7 +422,8 @@ server <- function(input, output, session) {
   output$prediction_target_ui <- renderUI({
     req(cleaned_data())
     colnames <- names(cleaned_data())
-    selectInput("target_variable", "Select Target Variable", choices = colnames)
+    num_cols <- names(select_if(cleaned_data(), is.numeric))
+    selectInput("target_variable", "Select Target Variable (Numeric)", choices = num_cols)
   })
   
   output$predictor_inputs_ui <- renderUI({
@@ -539,24 +586,14 @@ server <- function(input, output, session) {
     }
   })
   
-  # Run prediction
-  observeEvent(input$run_prediction, {
-    req(cleaned_data(), input$target_variable)
-    df <- cleaned_data()
-    target <- input$target_variable
-    predictors <- setdiff(names(df), target)
-    
-    # Check if target is numeric
+  # Helper function to preprocess data for modeling
+  preprocess_data <- function(df, target) {
+    # Ensure target is numeric
     if (!is.numeric(df[[target]])) {
-      output$prediction_results <- renderPrint({
-        "Error: Target variable must be numeric for linear regression."
-      })
-      output$model_summary <- renderPrint({
-        NULL
-      })
-      current_model(NULL)
-      return()
+      return(list(success = FALSE, message = "Target variable must be numeric for regression."))
     }
+    
+    predictors <- setdiff(names(df), target)
     
     # Subset the data and handle NA values
     model_df <- df %>% select(all_of(c(target, predictors)))
@@ -571,76 +608,321 @@ server <- function(input, output, session) {
     # Convert categorical predictors to factors
     model_df <- model_df %>% mutate(across(where(~!is.numeric(.)), as.factor))
     
-    output$prediction_results <- renderPrint({
-      if (nrow(model_df) < 2) {
-        current_model(NULL)
-        "Error: At least 2 rows are required for prediction modeling."
-      } else if (nrow(model_df) <= length(predictors) + 1) {
-        mean_value <- mean(model_df[[target]], na.rm = TRUE)
-        current_model(NULL)
-        paste("Dataset too small for regression. Using mean prediction.\n",
-              "Predicted", target, ":", mean_value)
-      } else {
-        # Try to build the model
-        model <- tryCatch({
-          train(as.formula(paste(target, "~ .")), 
-                data = model_df, 
-                method = "lm",
-                trControl = trainControl(method = "none"))
-        }, error = function(e) {
-          cat("Model training error:", e$message, "\n")
-          return(NULL)
-        })
+    # Check if we have enough data
+    if (nrow(model_df) < 2) {
+      return(list(success = FALSE, message = "Error: At least 2 rows are required for prediction modeling."))
+    } else if (nrow(model_df) <= length(predictors) + 1) {
+      return(list(success = FALSE, message = "Dataset too small for regression. Consider removing some predictors."))
+    }
+    
+    return(list(success = TRUE, data = model_df))
+  }
+  
+  # Run prediction with multiple models
+  observeEvent(input$run_prediction, {
+    req(cleaned_data(), input$target_variable, input$selected_models)
+    
+    # Check if at least one model is selected
+    if (length(input$selected_models) == 0) {
+      output$prediction_results <- renderPrint({
+        "Error: Please select at least one regression model."
+      })
+      return()
+    }
+    
+    df <- cleaned_data()
+    target <- input$target_variable
+    
+    # Preprocess data
+    result <- preprocess_data(df, target)
+    
+    if (!result$success) {
+      output$prediction_results <- renderPrint({
+        result$message
+      })
+      output$model_summary <- renderPrint({
+        NULL
+      })
+      return()
+    }
+    
+    model_df <- result$data
+    
+    # Prepare cross-validation settings
+    if (input$cv_method == "none") {
+      trControl <- trainControl(method = "none")
+    } else if (input$cv_method == "cv") {
+      trControl <- trainControl(method = "cv", number = input$cv_k)
+    } else if (input$cv_method == "repeatedcv") {
+      trControl <- trainControl(method = "repeatedcv", number = input$cv_k, repeats = input$cv_repeats)
+    }
+    
+    # Initialize storage for model results
+    models_list <- list()
+    model_results <- data.frame(
+      Model = character(),
+      RMSE = numeric(),
+      MAE = numeric(),
+      Rsquared = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    withProgress(message = 'Training models...', value = 0, {
+      # Train all selected models
+      for (i in seq_along(input$selected_models)) {
+        method <- input$selected_models[i]
+        model_name <- names(which(c(
+          "lm" = "Linear Regression",
+          "glmnet" = "Ridge Regression",
+          "lasso" = "Lasso Regression",
+          "rf" = "Random Forest", 
+          "gbm" = "Gradient Boosting", 
+          "xgbTree" = "XGBoost",
+          "svmRadial" = "Support Vector Regression",
+          "earth" = "MARS"
+        ) == method))
         
-        current_model(model)
+        incProgress(1/length(input$selected_models), detail = paste("Training", model_name))
         
-        if (is.null(model)) {
-          "Error: Failed to train the model. Check data consistency or predictors."
-        } else {
-          # Create new data for prediction from inputs
-          new_data <- data.frame(row.names = 1)
-          for (col in predictors) {
-            input_value <- input[[paste0("input_", col)]]
-            # Handle numeric vs categorical differently
-            if (is.numeric(model_df[[col]])) {
-              new_data[[col]] <- as.numeric(input_value)
-            } else {
-              new_data[[col]] <- as.character(input_value)
-            }
+        tryCatch({
+          # Set method-specific tuning parameters
+          tuneGrid <- NULL
+          if (method == "glmnet") {
+            tuneGrid <- expand.grid(alpha = 0, lambda = seq(0.001, 1, length = 10))
+          } else if (method == "lasso") {
+            method <- "glmnet"  # Use glmnet with alpha=1 for lasso
+            tuneGrid <- expand.grid(alpha = 1, lambda = seq(0.001, 1, length = 10))
           }
           
-          # Convert factors to match the model
-          for (col in predictors) {
-            if (is.factor(model_df[[col]])) {
-              new_data[[col]] <- factor(new_data[[col]], levels = levels(model_df[[col]]))
-            }
-          }
+          model <- train(
+            as.formula(paste(target, "~ .")), 
+            data = model_df, 
+            method = method,
+            trControl = trControl,
+            tuneGrid = tuneGrid,
+            preProcess = c("center", "scale"),  # Standardize predictors
+            # For many models, maximize = TRUE is the default for accuracy metrics
+            maximize = TRUE
+          )
           
-          # Make the prediction
-          prediction <- tryCatch({
-            predict(model, newdata = new_data)
-          }, error = function(e) {
-            paste("Error making prediction:", e$message)
-          })
+          # Store model
+          models_list[[model_name]] <- model
           
-          if (is.character(prediction)) {
-            prediction
+          # Extract performance metrics
+          if (is.null(model$results$RMSE)) {
+            # For models without cross-validation, compute metrics manually
+            pred <- predict(model, newdata = model_df)
+            rmse <- sqrt(mean((model_df[[target]] - pred)^2, na.rm = TRUE))
+            mae <- mean(abs(model_df[[target]] - pred), na.rm = TRUE)
+            rsq <- cor(model_df[[target]], pred, use = "complete.obs")^2
           } else {
-            paste("Predicted", target, ":", round(prediction, 4))
+            # For models with cross-validation, use the best performance metrics
+            best_idx <- which.min(model$results$RMSE)
+            rmse <- model$results$RMSE[best_idx]
+            mae <- if(is.null(model$results$MAE)) NA else model$results$MAE[best_idx]
+            rsq <- model$results$Rsquared[best_idx]
           }
-        }
+          
+          # Add to results table
+          model_results <- rbind(model_results, data.frame(
+            Model = model_name,
+            RMSE = rmse,
+            MAE = mae,
+            Rsquared = rsq,
+            stringsAsFactors = FALSE
+          ))
+        }, error = function(e) {
+          # Log errors but continue with other models
+          cat("Error training", model_name, ":", e$message, "\n")
+        })
       }
     })
     
-    # Display model summary if available
-    output$model_summary <- renderPrint({
-      model <- current_model()
-      if (!is.null(model)) {
-        cat("Model Summary:\n")
-        summary(model$finalModel)
+    # Store all models
+    all_models(models_list)
+    
+    # Determine best model (lowest RMSE)
+    if (nrow(model_results) > 0) {
+      best_model_name <- model_results$Model[which.min(model_results$RMSE)]
+      best_model(models_list[[best_model_name]])
+      
+      # Create new data for prediction from inputs
+      new_data <- data.frame(row.names = 1)
+      predictors <- setdiff(names(model_df), target)
+      for (col in predictors) {
+        input_value <- input[[paste0("input_", col)]]
+        # Handle numeric vs categorical differently
+        if (is.numeric(model_df[[col]])) {
+          new_data[[col]] <- as.numeric(input_value)
+        } else {
+          new_data[[col]] <- as.character(input_value)
+        }
       }
-    })
+      
+      # Convert factors to match the model
+      for (col in predictors) {
+        if (is.factor(model_df[[col]])) {
+          new_data[[col]] <- factor(new_data[[col]], levels = levels(model_df[[col]]))
+        }
+      }
+      
+      # Make prediction with best model
+      best_prediction <- tryCatch({
+        predict(models_list[[best_model_name]], newdata = new_data)
+      }, error = function(e) {
+        paste("Error making prediction with best model:", e$message)
+      })
+      
+      # Display prediction results
+      output$prediction_results <- renderPrint({
+        cat("Model Comparison Results:\n")
+        print(model_results[order(model_results$RMSE), ])
+        cat("\nBest Model: ", best_model_name, "\n")
+        if (is.character(best_prediction)) {
+          cat(best_prediction)
+        } else {
+          cat("Predicted", target, ":", round(best_prediction, 4))
+        }
+      })
+      
+      # Display model comparison plot
+      output$model_comparison_plot <- renderPlot({
+        model_results$Model <- factor(model_results$Model, 
+            levels = model_results$Model[order(model_results$RMSE)])
+        
+        ggplot(model_results, aes(x = Model, y = RMSE, fill = Model)) +
+          geom_bar(stat = "identity") +
+          coord_flip() +
+          labs(title = "Model Comparison (Lower RMSE is Better)",
+               x = "Regression Model", 
+               y = "Root Mean Square Error (RMSE)") +
+          theme_minimal() +
+          theme(legend.position = "none")
+      })
+      
+      # Display the best model summary
+      output$model_summary <- renderPrint({
+        best <- best_model()
+        if (!is.null(best)) {
+          cat("Best Model Summary:\n")
+          print(best)
+          
+          # For linear models, also show coefficients
+          if (best$method %in% c("lm", "glmnet")) {
+            cat("\nModel Coefficients:\n")
+            print(coef(best$finalModel))
+          }
+        }
+      })
+      
+      # Display variable importance plot if available
+      output$variable_importance_plot <- renderPlot({
+        best <- best_model()
+        if (is.null(best)) return(NULL)
+        
+        # Try to extract variable importance
+        importance <- tryCatch({
+          if (best$method %in% c("rf", "gbm", "xgbTree", "earth")) {
+            varImp(best)
+          } else {
+            NULL
+          }
+        }, error = function(e) {
+          NULL
+        })
+        
+        if (!is.null(importance)) {
+          # Plot variable importance
+          plot(importance, main = "Variable Importance for Best Model")
+        } else {
+          # For models without built-in importance
+          if (best$method %in% c("lm", "glmnet")) {
+            # For linear models, create a custom importance plot from coefficients
+            coefs <- coef(best$finalModel)
+            
+            # For glmnet, extract coefficients for best lambda
+            if (best$method == "glmnet") {
+              best_lambda_idx <- which(best$finalModel$lambda == best$bestTune$lambda)
+              coefs <- coef(best$finalModel, s = best$bestTune$lambda)
+            }
+            
+            # Exclude intercept, convert to data frame, and take absolute values
+            coef_df <- data.frame(
+              Variable = rownames(coefs)[-1],
+              Importance = abs(as.numeric(coefs)[-1])
+            )
+            
+            # Sort by importance
+            coef_df <- coef_df[order(coef_df$Importance, decreasing = TRUE), ]
+            coef_df$Variable <- factor(coef_df$Variable, levels = coef_df$Variable)
+            
+            ggplot(coef_df, aes(x = Variable, y = Importance)) +
+              geom_bar(stat = "identity", fill = "skyblue") +
+              coord_flip() +
+              labs(title = "Variable Importance (Absolute Coefficient Values)",
+                   x = "Predictor Variable", 
+                   y = "Importance") +
+              theme_minimal()
+          } else {
+            # For other models without variable importance
+            plot.new()
+            title("Variable importance not available for this model type")
+          }
+        }
+      })
+      
+    } else {
+      output$prediction_results <- renderPrint({
+        "All models failed to train. Please check your data or model selections."
+      })
+      output$model_summary <- renderPrint({
+        NULL
+      })
+    }
+  })
+  
+  # Model comparison tab - display comparison of all models
+  output$model_comparison_results <- renderPrint({
+    models <- all_models()
+    if (length(models) == 0) {
+      "No models have been trained yet. Please run prediction first."
+    } else {
+      cat("Model Performance Comparison:\n")
+      model_results <- data.frame(
+        Model = names(models),
+        RMSE = sapply(models, function(m) {
+          if (is.null(m$results$RMSE)) {
+            pred <- predict(m, newdata = m$trainingData)
+            sqrt(mean((m$trainingData$.outcome - pred)^2, na.rm = TRUE))
+          } else {
+            min(m$results$RMSE)
+          }
+        }),
+        Rsquared = sapply(models, function(m) {
+          if (is.null(m$results$Rsquared)) {
+            pred <- predict(m, newdata = m$trainingData)
+            cor(m$trainingData$.outcome, pred, use = "complete.obs")^2
+          } else {
+            max(m$results$Rsquared)
+          }
+        }),
+        stringsAsFactors = FALSE
+      )
+      model_results <- model_results[order(model_results$RMSE), ]
+      print(model_results)
+      
+      cat("\nBest Model: ", model_results$Model[1], "\n")
+      
+      # Print information about the cross-validation used
+      if (input$cv_method == "none") {
+        cat("\nNote: No cross-validation was used. Consider using cross-validation for more reliable results.\n")
+      } else if (input$cv_method == "cv") {
+        cat("\nCross-validation: ", input$cv_k, "-fold CV\n")
+      } else if (input$cv_method == "repeatedcv") {
+        cat("\nCross-validation: ", input$cv_k, "-fold CV with ", input$cv_repeats, " repeats\n")
+      }
+    }
   })
 }
 
-shinyApp(ui, server)git push 
+shinyApp(ui, server)
