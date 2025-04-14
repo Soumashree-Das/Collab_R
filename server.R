@@ -456,307 +456,325 @@ server <- function(input, output, session) {
   })
   
   # Run prediction (preprocess_data will be sourced from preprocessing.R)
-  observeEvent(input$run_prediction, {
-    req(cleaned_data(), input$target_variable, input$selected_models)
+  # [Previous server code remains unchanged until observeEvent for run_prediction]
+
+# Run prediction
+observeEvent(input$run_prediction, {
+  req(cleaned_data(), input$target_variable, input$selected_models)
+  
+  tryCatch({
+    if (length(input$selected_models) == 0) {
+      output$prediction_results <- renderPrint({
+        "Error: Please select at least one regression model."
+      })
+      return()
+    }
     
-    tryCatch({
-      if (length(input$selected_models) == 0) {
-        output$prediction_results <- renderPrint({
-          "Error: Please select at least one regression model."
-        })
-        return()
-      }
-      
-      df <- cleaned_data()
-      target <- input$target_variable
-      
-      # Preprocess data
-      result <- preprocess_data(df, target)
-      if (!result$success) {
-        output$prediction_results <- renderPrint({
-          cat("Preprocessing Error:", result$message, "\n")
-        })
-        output$model_summary <- renderPrint({ NULL })
-        return()
-      }
-      model_data(result$data)
-      preproc_obj(result$preproc)
-      dmy_obj(result$dmy)
-      
-      cat("Preprocessed data dimensions:", dim(result$data), "\n")
-      
-      # Set up cross-validation
-      if (input$cv_method == "none") {
-        ctrl <- trainControl(method = "none")
-      } else if (input$cv_method == "cv") {
-        ctrl <- trainControl(method = "cv", number = input$cv_k, verboseIter = FALSE)
-      } else {
-        ctrl <- trainControl(method = "repeatedcv", number = input$cv_k, repeats = input$cv_repeats, verboseIter = FALSE)
-      }
-      
-      # Train models
-      model_results <- list()
-      model_list <- list()
-      formula <- as.formula(paste(target, "~ ."))
-      
-      withProgress(message = "Training models...", value = 0, {
-        for (model_type in input$selected_models) {
-          incProgress(1/length(input$selected_models), detail = paste("Training", model_type))
-          tryCatch({
-            tune_grid <- NULL
-            actual_model_type <- model_type
-            
-            if (model_type == "glmnet") {
-              tune_grid <- expand.grid(alpha = 0, lambda = seq(0.001, 1, length.out = 10))
-            } else if (model_type == "lasso") {
-              tune_grid <- expand.grid(alpha = 1, lambda = seq(0.001, 1, length.out = 10))
-              actual_model_type <- "glmnet"
-            } else if (model_type == "rf") {
-              tune_grid <- expand.grid(mtry = min(floor(sqrt(ncol(result$data) - 1)), ncol(result$data) - 1))
-            } else if (model_type == "xgbTree") {
-              tune_grid <- expand.grid(
-                nrounds = 100, max_depth = 6, eta = 0.3, gamma = 0,
-                colsample_bytree = 1, min_child_weight = 1, subsample = 1
-              )
-            } else if (model_type == "svmRadial") {
-              tune_grid <- expand.grid(sigma = 0.1, C = 1)
-            } else if (model_type == "gbm") {
-              tune_grid <- expand.grid(
-                n.trees = 100, interaction.depth = 3, shrinkage = 0.1, n.minobsinnode = 10
-              )
-            } else if (model_type == "earth") {
-              tune_grid <- expand.grid(degree = 1, nprune = 10)
-            }
-            
-            model <- train(
-              formula,
-              data = result$data,
-              method = actual_model_type,
-              trControl = ctrl,
-              tuneGrid = tune_grid,
-              preProcess = NULL,
-              metric = "RMSE",
-              na.action = na.omit,
-              verbose = FALSE
-            )
-            model_list[[model_type]] <- model
-            predictions <- predict(model, newdata = result$data)
-            rmse <- sqrt(mean((result$data[[target]] - predictions)^2, na.rm = TRUE))
-            mape <- mean(abs((result$data[[target]] - predictions) / result$data[[target]]), na.rm = TRUE) * 100
-            r_squared <- tryCatch({
-              summary(lm(predictions ~ result$data[[target]]))$r.squared
-            }, error = function(e) NA)
-            model_results[[model_type]] <- list(
-              RMSE = rmse,
-              MAPE = mape,
-              R_Squared = r_squared,
-              model = model
-            )
-            cat(sprintf("Model %s trained successfully. RMSE: %.2f\n", model_type, rmse))
-          }, error = function(e) {
-            model_results[[model_type]] <<- list(
-              RMSE = NA,
-              MAPE = NA,
-              R_Squared = NA,
-              Error = paste("Error training", model_type, ":", as.character(e))
-            )
-            cat(sprintf("Error training %s: %s\n", model_type, as.character(e)))
-          })
-        }
-      })
-      
-      valid_models <- model_results[!sapply(model_results, function(x) is.na(x$RMSE))]
-      if (length(valid_models) == 0) {
-        output$prediction_results <- renderPrint({
-          cat("Error: No valid models could be trained. Check the console for details.\n")
-        })
-        output$model_summary <- renderPrint({ NULL })
-        return()
-      }
-      
-      rmse_values <- sapply(valid_models, function(x) x$RMSE)
-      best_model_name <- names(which.min(rmse_values))
-      best_model(model_list[[best_model_name]])
-      all_models(model_list)
-      
-      cat("Best model:", best_model_name, "\n")
-      cat("Expected predictors:", paste(names(result$data)[names(result$data) != target], collapse = ", "), "\n")
-      
-      # Gather new inputs and include all original predictors
-      new_data <- data.frame(row.names = 1)
-      for (col in setdiff(names(df), target)) {
-        input_name <- paste0("input_", make.names(col))
-        val <- input[[input_name]]
-        if (!is.null(val)) {
-          new_data[[col]] <- val
-        } else {
-          if (is.numeric(df[[col]])) {
-            new_data[[col]] <- mean(df[[col]], na.rm = TRUE)
-          } else {
-            unique_vals <- unique(df[[col]])
-            unique_vals <- unique_vals[!is.na(unique_vals)]
-            new_data[[col]] <- if (length(unique_vals) > 0) unique_vals[1] else NA
-          }
-        }
-      }
-      
-      # Preprocess new_data with the same dummyVars and preProcess objects
-      if (!is.null(dmy_obj())) {
-        cat_predictors <- names(df)[sapply(df, is.factor)]
-        if (length(cat_predictors) > 0) {
-          new_cat_data <- new_data[, cat_predictors, drop = FALSE]
-          for (col in names(new_cat_data)) {
-            if (!all(levels(df[[col]]) %in% new_cat_data[[col]])) {
-              new_cat_data[[col]] <- factor(new_cat_data[[col]], levels = levels(df[[col]]))
-            }
-          }
-          new_cat_matrix <- predict(dmy_obj(), new_cat_data)
-          new_numeric_data <- new_data[, setdiff(names(new_data), cat_predictors), drop = FALSE]
-          new_data <- cbind(new_numeric_data, new_cat_matrix)
-        }
-      }
-      # Ensure all columns are present, even if NA
-      for (col in setdiff(names(result$data)[names(result$data) != target], names(new_data))) {
-        new_data[[col]] <- NA
-      }
-      new_data <- new_data[, names(result$data)[names(result$data) != target]]  # Match order
-      new_data_processed <- predict(preproc_obj(), new_data)
-      cat("New data processed columns:", paste(names(new_data_processed), collapse = ", "), "\n")
-      cat("New data processed dimensions:", dim(new_data_processed), "\n")
-      
-      # Validate and align new_data_processed
-      if (ncol(new_data_processed) != ncol(result$data) - 1) {
-        cat("Warning: Column mismatch between new data and training data.\n")
-        for (col in setdiff(names(result$data)[names(result$data) != target], names(new_data_processed))) {
-          new_data_processed[[col]] <- 0
-        }
-        new_data_processed <- new_data_processed[, names(result$data)[names(result$data) != target]]
-      }
-      cat("Aligned new data columns:", paste(names(new_data_processed), collapse = ", "), "\n")
-      
-      # Make prediction with detailed error handling
-      prediction_value <- tryCatch({
-        predict(best_model(), newdata = as.data.frame(new_data_processed))
-      }, error = function(e) {
-        cat("Prediction error:", as.character(e), "\n")
-        cat("New data processed structure:", str(new_data_processed), "\n")
-        cat("Training data structure:", str(result$data[, names(result$data) != target]), "\n")
-        paste("Error making prediction:", as.character(e))
-      })
-      
-      # Display results
+    df <- cleaned_data()
+    target <- input$target_variable
+    
+    # Preprocess data
+    result <- preprocess_data(df, target)
+    if (!result$success) {
       output$prediction_results <- renderPrint({
-        cat("Model Comparison Results:\n")
-        metrics_df <- do.call(rbind, lapply(names(model_results), function(name) {
-          res <- model_results[[name]]
-          if (!is.na(res$RMSE)) {
-            data.frame(Model = name, RMSE = res$RMSE, MAPE = res$MAPE, R_Squared = res$R_Squared)
-          } else {
-            data.frame(Model = name, RMSE = NA, MAPE = NA, R_Squared = NA, Error = res$Error)
-          }
-        }))
-        print(metrics_df)
-        cat("\nBest Model:", best_model_name, "\n")
-        cat("\nPrediction for target variable", target, ":", prediction_value, "\n")
-      })
-      
-      output$model_summary <- renderPrint({
-        cat("Best Model Summary:\n")
-        print(best_model())
-      })
-      
-      output$variable_importance_plot <- renderPlot({
-        req(best_model())
-        has_importance <- FALSE
-        tryCatch({
-          if ("varImp" %in% methods(class = class(best_model())[1])) {
-            importance <- varImp(best_model(), scale = TRUE)
-            imp_df <- as.data.frame(importance$importance)
-            validate(need(nrow(imp_df) > 0, "No variable importance data available."))
-            imp_df$Variable <- rownames(imp_df)
-            imp_df$Importance <- imp_df$Overall
-            imp_df <- imp_df[order(imp_df$Importance, decreasing = TRUE), ]
-            if (nrow(imp_df) > 15) {
-              imp_df <- imp_df[1:15, ]
-            }
-            ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
-              geom_bar(stat = "identity", fill = "steelblue") +
-              coord_flip() +
-              labs(title = "Variable Importance", x = "Variables", y = "Importance") +
-              theme_minimal()
-            has_importance <- TRUE
-          }
-        }, error = function(e) {
-          has_importance <- FALSE
-        })
-        if (!has_importance) {
-          plot.new()
-          title("Variable importance not available for this model type")
-        }
-      })
-      
-      output$model_comparison_plot <- renderPlot({
-        req(model_results)
-        metrics_df <- do.call(rbind, lapply(names(model_results), function(name) {
-          res <- model_results[[name]]
-          if (!is.na(res$RMSE)) {
-            data.frame(Model = name, RMSE = res$RMSE, MAPE = res$MAPE, R_Squared = res$R_Squared)
-          } else {
-            NULL
-          }
-        }))
-        metrics_df <- na.omit(metrics_df)
-        if (nrow(metrics_df) == 0) {
-          plot.new()
-          title("No valid models to compare due to prediction failure.")
-          cat("Warning: No valid metrics_df for comparison plot.\n")
-        } else {
-          metrics_long <- tidyr::pivot_longer(
-            metrics_df, 
-            cols = c("RMSE", "MAPE", "R_Squared"),
-            names_to = "Metric", 
-            values_to = "Value"
-          )
-          ggplot(metrics_long, aes(x = Model, y = Value, fill = Model)) +
-            geom_bar(stat = "identity") +
-            facet_wrap(~ Metric, scales = "free") +
-            theme_minimal() +
-            theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-            labs(title = "Model Comparison")
-        }
-      })
-      
-      output$model_comparison_results <- renderPrint({
-        req(model_results)
-        cat("Model Comparison Results:\n")
-        metrics_df <- do.call(rbind, lapply(names(model_results), function(name) {
-          res <- model_results[[name]]
-          if (!is.na(res$RMSE)) {
-            data.frame(Model = name, RMSE = res$RMSE, MAPE = res$MAPE, R_Squared = res$R_Squared)
-          } else {
-            data.frame(Model = name, RMSE = NA, MAPE = NA, R_Squared = NA, Error = res$Error)
-          }
-        }))
-        print(metrics_df)
-      })
-      
-    }, error = function(e) {
-      output$prediction_results <- renderPrint({
-        paste("Error during prediction:", as.character(e))
+        cat("Preprocessing Error:", result$message, "\n")
       })
       output$model_summary <- renderPrint({ NULL })
-      output$variable_importance_plot <- renderPlot({
-        plot.new()
-        title("Prediction failed")
-      })
-      output$model_comparison_results <- renderPrint({
-        cat("Error: Model comparison could not be performed. Check the console for details.\n")
-      })
-      output$model_comparison_plot <- renderPlot({
-        plot.new()
-        title("Model comparison failed")
-      })
-      showNotification("Prediction failed. Check your inputs and dataset.", type = "error")
+      return()
+    }
+    model_data(result$data)
+    preproc_obj(result$preproc)
+    dmy_obj(result$dmy)
+    
+    cat("Preprocessed data dimensions:", dim(result$data), "\n")
+    
+    # Set up cross-validation
+    if (input$cv_method == "none") {
+      ctrl <- trainControl(method = "none")
+    } else if (input$cv_method == "cv") {
+      ctrl <- trainControl(method = "cv", number = input$cv_k, verboseIter = FALSE)
+    } else {
+      ctrl <- trainControl(method = "repeatedcv", number = input$cv_k, repeats = input$cv_repeats, verboseIter = FALSE)
+    }
+    
+    # Train models
+    model_results <- list()
+    model_list <- list()
+    formula <- as.formula(paste(target, "~ ."))
+    
+    withProgress(message = "Training models...", value = 0, {
+      for (model_type in input$selected_models) {
+        incProgress(1/length(input$selected_models), detail = paste("Training", model_type))
+        tryCatch({
+          tune_grid <- NULL
+          actual_model_type <- model_type
+          
+          if (model_type == "glmnet") {
+            tune_grid <- expand.grid(alpha = 0, lambda = seq(0.001, 1, length.out = 10))
+          } else if (model_type == "lasso") {
+            tune_grid <- expand.grid(alpha = 1, lambda = seq(0.001, 1, length.out = 10))
+            actual_model_type <- "glmnet"
+          } else if (model_type == "rf") {
+            tune_grid <- expand.grid(mtry = min(floor(sqrt(ncol(result$data) - 1)), ncol(result$data) - 1))
+          } else if (model_type == "xgbTree") {
+            tune_grid <- expand.grid(
+              nrounds = 100, max_depth = 6, eta = 0.3, gamma = 0,
+              colsample_bytree = 1, min_child_weight = 1, subsample = 1
+            )
+          } else if (model_type == "svmRadial") {
+            tune_grid <- expand.grid(sigma = 0.1, C = 1)
+          } else if (model_type == "gbm") {
+            tune_grid <- expand.grid(
+              n.trees = 100, interaction.depth = 3, shrinkage = 0.1, n.minobsinnode = 10
+            )
+          } else if (model_type == "earth") {
+            tune_grid <- expand.grid(degree = 1, nprune = 10)
+          }
+          
+          model <- train(
+            formula,
+            data = result$data,
+            method = actual_model_type,
+            trControl = ctrl,
+            tuneGrid = tune_grid,
+            preProcess = NULL,
+            metric = "RMSE",
+            na.action = na.omit,
+            verbose = FALSE
+          )
+          model_list[[model_type]] <- model
+          predictions <- predict(model, newdata = result$data)
+          rmse <- sqrt(mean((result$data[[target]] - predictions)^2, na.rm = TRUE))
+          mape <- mean(abs((result$data[[target]] - predictions) / result$data[[target]]), na.rm = TRUE) * 100
+          r_squared <- tryCatch({
+            summary(lm(predictions ~ result$data[[target]]))$r.squared
+          }, error = function(e) NA)
+          model_results[[model_type]] <- list(
+            RMSE = rmse,
+            MAPE = mape,
+            R_Squared = r_squared,
+            model = model
+          )
+          cat(sprintf("Model %s trained successfully. RMSE: %.2f\n", model_type, rmse))
+        }, error = function(e) {
+          model_results[[model_type]] <<- list(
+            RMSE = NA,
+            MAPE = NA,
+            R_Squared = NA,
+            Error = paste("Error training", model_type, ":", as.character(e))
+          )
+          cat(sprintf("Error training %s: %s\n", model_type, as.character(e)))
+        })
+      }
     })
+    
+    valid_models <- model_results[!sapply(model_results, function(x) is.na(x$RMSE))]
+    if (length(valid_models) == 0) {
+      output$prediction_results <- renderPrint({
+        cat("Error: No valid models could be trained. Check the console for details.\n")
+      })
+      output$model_summary <- renderPrint({ NULL })
+      return()
+    }
+    
+    rmse_values <- sapply(valid_models, function(x) x$RMSE)
+    best_model_name <- names(which.min(rmse_values))
+    best_model(model_list[[best_model_name]])
+    all_models(model_list)
+    
+    cat("Best model:", best_model_name, "\n")
+    cat("Expected predictors:", paste(names(result$data)[names(result$data) != target], collapse = ", "), "\n")
+    
+    # Gather new inputs and include all original predictors
+    new_data <- data.frame(row.names = 1)
+    for (col in setdiff(names(df), target)) {
+      input_name <- paste0("input_", make.names(col))
+      val <- input[[input_name]]
+      if (!is.null(val)) {
+        new_data[[col]] <- val
+      } else {
+        if (is.numeric(df[[col]])) {
+          new_data[[col]] <- mean(df[[col]], na.rm = TRUE)
+        } else {
+          unique_vals <- unique(df[[col]])
+          unique_vals <- unique_vals[!is.na(unique_vals)]
+          new_data[[col]] <- if (length(unique_vals) > 0) unique_vals[1] else NA
+        }
+      }
+    }
+    
+    # Preprocess new_data with the same dummyVars and preProcess objects
+    if (!is.null(dmy_obj())) {
+      cat_predictors <- names(df)[sapply(df, is.factor)]
+      if (length(cat_predictors) > 0) {
+        new_cat_data <- new_data[, cat_predictors, drop = FALSE]
+        # Ensure factor levels match training data
+        for (col in names(new_cat_data)) {
+          if (!is.factor(new_cat_data[[col]])) {
+            new_cat_data[[col]] <- factor(new_cat_data[[col]])
+          }
+          if (!all(levels(df[[col]]) %in% new_cat_data[[col]])) {
+            new_cat_data[[col]] <- factor(new_cat_data[[col]], levels = levels(df[[col]]))
+          }
+        }
+        new_cat_matrix <- predict(dmy_obj(), new_cat_data)
+        new_numeric_data <- new_data[, setdiff(names(new_data), cat_predictors), drop = FALSE]
+        new_data <- cbind(new_numeric_data, new_cat_matrix)
+      }
+    }
+    
+    # Ensure all training predictors are present, even if NA
+    training_predictors <- names(result$data)[names(result$data) != target]
+    for (col in setdiff(training_predictors, names(new_data))) {
+      new_data[[col]] <- NA
+    }
+    new_data <- new_data[, training_predictors]  # Match order and columns
+    
+    # Apply preprocessing
+    new_data_processed <- predict(preproc_obj(), as.data.frame(new_data))
+    cat("New data processed columns:", paste(names(new_data_processed), collapse = ", "), "\n")
+    cat("New data processed dimensions:", dim(new_data_processed), "\n")
+    
+    # Validate new_data_processed
+    if (ncol(new_data_processed) != length(training_predictors)) {
+      cat("Warning: Column mismatch detected. Expected", length(training_predictors), "columns, got", ncol(new_data_processed), "\n")
+      # Add missing columns with default value (e.g., 0)
+      for (col in setdiff(training_predictors, names(new_data_processed))) {
+        new_data_processed[[col]] <- 0
+      }
+      new_data_processed <- new_data_processed[, training_predictors]
+      cat("Aligned new data columns:", paste(names(new_data_processed), collapse = ", "), "\n")
+    }
+    
+    # Handle NA values
+    new_data_processed <- as.data.frame(lapply(new_data_processed, function(x) ifelse(is.na(x), 0, x)))
+    
+    # Make prediction with detailed error handling
+    prediction_value <- tryCatch({
+      pred <- predict(best_model(), newdata = new_data_processed)
+      if (length(pred) == 1) pred else stop("Multiple predictions returned, expected single value")
+    }, error = function(e) {
+      cat("Prediction error:", as.character(e), "\n")
+      cat("New data processed structure:", str(new_data_processed), "\n")
+      cat("Training data predictor structure:", str(result$data[, training_predictors]), "\n")
+      stop("Prediction failed due to data mismatch or model issue. Check console for details.")
+    })
+    
+    # Display results
+    output$prediction_results <- renderPrint({
+      cat("Model Comparison Results:\n")
+      metrics_df <- do.call(rbind, lapply(names(model_results), function(name) {
+        res <- model_results[[name]]
+        if (!is.na(res$RMSE)) {
+          data.frame(Model = name, RMSE = res$RMSE, MAPE = res$MAPE, R_Squared = res$R_Squared)
+        } else {
+          data.frame(Model = name, RMSE = NA, MAPE = NA, R_Squared = NA, Error = res$Error)
+        }
+      }))
+      print(metrics_df)
+      cat("\nBest Model:", best_model_name, "\n")
+      cat("\nPrediction for target variable", target, ":", prediction_value, "\n")
+    })
+    
+    output$model_summary <- renderPrint({
+      cat("Best Model Summary:\n")
+      print(best_model())
+    })
+    
+    output$variable_importance_plot <- renderPlot({
+      req(best_model())
+      has_importance <- FALSE
+      tryCatch({
+        if ("varImp" %in% methods(class = class(best_model())[1])) {
+          importance <- varImp(best_model(), scale = TRUE)
+          imp_df <- as.data.frame(importance$importance)
+          validate(need(nrow(imp_df) > 0, "No variable importance data available."))
+          imp_df$Variable <- rownames(imp_df)
+          imp_df$Importance <- imp_df$Overall
+          imp_df <- imp_df[order(imp_df$Importance, decreasing = TRUE), ]
+          if (nrow(imp_df) > 15) {
+            imp_df <- imp_df[1:15, ]
+          }
+          ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+            geom_bar(stat = "identity", fill = "steelblue") +
+            coord_flip() +
+            labs(title = "Variable Importance", x = "Variables", y = "Importance") +
+            theme_minimal()
+          has_importance <- TRUE
+        }
+      }, error = function(e) {
+        has_importance <- FALSE
+      })
+      if (!has_importance) {
+        plot.new()
+        title("Variable importance not available for this model type")
+      }
+    })
+    
+    output$model_comparison_plot <- renderPlot({
+      req(model_results)
+      metrics_df <- do.call(rbind, lapply(names(model_results), function(name) {
+        res <- model_results[[name]]
+        if (!is.na(res$RMSE)) {
+          data.frame(Model = name, RMSE = res$RMSE, MAPE = res$MAPE, R_Squared = res$R_Squared)
+        } else {
+          NULL
+        }
+      }))
+      metrics_df <- na.omit(metrics_df)
+      if (nrow(metrics_df) == 0) {
+        plot.new()
+        title("No valid models to compare due to prediction failure.")
+        cat("Warning: No valid metrics_df for comparison plot.\n")
+      } else {
+        metrics_long <- tidyr::pivot_longer(
+          metrics_df, 
+          cols = c("RMSE", "MAPE", "R_Squared"),
+          names_to = "Metric", 
+          values_to = "Value"
+        )
+        ggplot(metrics_long, aes(x = Model, y = Value, fill = Model)) +
+          geom_bar(stat = "identity") +
+          facet_wrap(~ Metric, scales = "free") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          labs(title = "Model Comparison")
+      }
+    })
+    
+    output$model_comparison_results <- renderPrint({
+      req(model_results)
+      cat("Model Comparison Results:\n")
+      metrics_df <- do.call(rbind, lapply(names(model_results), function(name) {
+        res <- model_results[[name]]
+        if (!is.na(res$RMSE)) {
+          data.frame(Model = name, RMSE = res$RMSE, MAPE = res$MAPE, R_Squared = res$R_Squared)
+        } else {
+          data.frame(Model = name, RMSE = NA, MAPE = NA, R_Squared = NA, Error = res$Error)
+        }
+      }))
+      print(metrics_df)
+    })
+    
+  }, error = function(e) {
+    output$prediction_results <- renderPrint({
+      paste("Error during prediction:", as.character(e))
+    })
+    output$model_summary <- renderPrint({ NULL })
+    output$variable_importance_plot <- renderPlot({
+      plot.new()
+      title("Prediction failed")
+    })
+    output$model_comparison_results <- renderPrint({
+      cat("Error: Model comparison could not be performed. Check the console for details.\n")
+    })
+    output$model_comparison_plot <- renderPlot({
+      plot.new()
+      title("Model comparison failed")
+    })
+    showNotification("Prediction failed. Check your inputs and dataset.", type = "error")
   })
+})
 }
+
+# [Rest of the server code remains unchanged]
