@@ -456,7 +456,6 @@ server <- function(input, output, session) {
   })
   
   # Run prediction (preprocess_data will be sourced from preprocessing.R)
-  # [Previous server code remains unchanged until observeEvent for run_prediction]
 
 # Run prediction
 observeEvent(input$run_prediction, {
