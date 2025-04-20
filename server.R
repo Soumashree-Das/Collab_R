@@ -775,5 +775,3 @@ observeEvent(input$run_prediction, {
   })
 })
 }
-
-# [Rest of the server code remains unchanged]
